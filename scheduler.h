@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <iostream>
 #include <thread>
@@ -46,15 +47,45 @@ private:
         }
     };
 
+    static bool timed_task_cmp(const Task *a, const Task *b)
+    {
+        if (a->condition.type != WakeupCondition::TIMER) {
+            throw std::logic_error("task a is not timed");
+        }
+        if (b->condition.type != WakeupCondition::TIMER) {
+            throw std::logic_error("task b is not timed");
+        }
+
+        return a->condition.wakeup_at > b->condition.wakeup_at;
+    }
+
+    using TaskArray = std::array<Task, max_tasks>;
+    using TaskPArray = std::array<Task*, max_tasks>;
+
 public:
     Scheduler():
-        m_tasks()
+        m_tasks(),
+        m_timed_tasks(),
+        m_timed_tasks_end(m_timed_tasks.begin()),
+        m_event_tasks(),
+        m_event_tasks_end(m_event_tasks.begin())
     {
 
     }
 
 private:
-    std::array<Task, max_tasks> m_tasks;
+    TaskArray m_tasks;
+    TaskPArray m_timed_tasks;
+    typename TaskPArray::iterator m_timed_tasks_end;
+    TaskPArray m_event_tasks;
+    typename TaskPArray::iterator m_event_tasks_end;
+
+private:
+    void add_timed_task(Task &task)
+    {
+        *m_timed_tasks_end++ = &task;
+        std::push_heap(m_timed_tasks.begin(), m_timed_tasks_end, &timed_task_cmp);
+    }
 
 public:
     template <typename coroutine_t, typename... arg_ts>
@@ -65,6 +96,7 @@ public:
                 (*coro)(args...);
                 task.coro = coro;
                 task.condition.type = WakeupCondition::NONE;
+                *m_event_tasks_end++ = &task;
                 return true;
             }
         }
@@ -75,68 +107,87 @@ public:
     {
         while (1) {
             sched_clock::time_point now = sched_clock::now();
-            auto cmp = [now](const Task &a, const Task &b) {
-                // always order live coroutines before dead ones
-                if (a.is_dead()) {
-                    return false;
-                } else if (b.is_dead()) {
-                    return true;
-                }
 
-                const bool a_runnable = a.can_run_now(now);
-                const bool b_runnable = b.can_run_now(now);
-
-                // order coroutines due for wakeup now before others
-                if (b_runnable) {
-                    return false;
-                } else if (a_runnable) {
-                    return true;
-                }
-
-                const WakeupCondition::WakeupConditionType ta = a.condition.type;
-                const WakeupCondition::WakeupConditionType tb = b.condition.type;
-
-                if (ta == WakeupCondition::TIMER && tb == WakeupCondition::TIMER) {
-                    return a.condition.wakeup_at < b.condition.wakeup_at;
-                }
-
-                // if "everything else" is not runnable, timers must sort
-                // before everything else
-                if (ta == WakeupCondition::TIMER && tb != WakeupCondition::TIMER) {
-                    return true;
-                }
-
-                return false;
-            };
-
-            std::sort(
-                        m_tasks.begin(),
-                        m_tasks.end(),
-                        cmp);
-
-            Task &first = m_tasks[0];
-            if (first.is_dead()) {
-                return;
-            }
-
-            if (first.condition.type == WakeupCondition::TIMER) {
-                sched_clock::time_point next_wakeup = first.condition.wakeup_at;
-                if (next_wakeup > now) {
-                    auto dt = next_wakeup - now;
-                    std::cout << "sleeping for " << std::chrono::duration_cast<std::chrono::milliseconds>(dt).count() << " ms" << std::endl;
-                    usleep(std::chrono::duration_cast<std::chrono::microseconds>(dt).count());
-                    auto new_now = sched_clock::now();
-                    std::cout << "woke up from sleep after " << std::chrono::duration_cast<std::chrono::milliseconds>(new_now - now).count() << " ms" << std::endl;
-                    continue;
-                }
-            }
-
-            for (Task &task: m_tasks) {
-                if (task.is_dead()) {
+            while (m_timed_tasks_end != m_timed_tasks.begin()
+                   && m_timed_tasks.front()->condition.wakeup_at <= now)
+            {
+                std::pop_heap(m_timed_tasks.begin(), m_timed_tasks_end);
+                Task &task = **(m_timed_tasks_end-1);
+                // std::cout << "task " << &task << " is ready to run (time-based)" << std::endl;
+                assert(task.condition.type == WakeupCondition::TIMER);
+                task.condition = task.coro->step();
+                switch (task.condition.type)
+                {
+                case WakeupCondition::TIMER:
+                {
+                    // re-add the task to the queue, no need to modify
+                    // m_timed_tasks_end
+                    std::push_heap(m_timed_tasks.begin(), m_timed_tasks_end);
                     break;
                 }
+                case WakeupCondition::NONE:
+                case WakeupCondition::EVENT:
+                {
+//                    std::cout << "  -> is now event-based" << std::endl;
+                    // move task to event list
+                    *m_event_tasks_end++ = &task;
+                    // intentionall fall-through
+                }
+                case WakeupCondition::FINSIHED:
+                {
+                    // remove task
+                    m_timed_tasks_end--;
+                    break;
+                }
+                }
+            }
+
+            for (auto iter = m_event_tasks.begin();
+                 iter != m_event_tasks_end;
+                 ++iter)
+            {
+                Task &task = **iter;
+                assert(task.condition.type == WakeupCondition::NONE ||
+                       task.condition.type == WakeupCondition::EVENT);
+//                std::cout << "inspecting task " << *iter << " (event-based)" << std::endl;
+                if (!task.can_run_now(now)) {
+//                    std::cout << "  not ready to run" << std::endl;
+                    continue;
+                }
                 if (task.can_run_now(now)) {
+//                    std::cout << "  ready to run" << std::endl;
                     task.condition = task.coro->step();
+                    switch (task.condition.type)
+                    {
+                    case WakeupCondition::TIMER:
+                    {
+//                        std::cout << "  -> is now timed" << std::endl;
+                        add_timed_task(task);
+                        // intentional fallthrough
+                    }
+                    case WakeupCondition::FINSIHED:
+                    {
+//                        std::cout << "replacing " << *iter
+//                                  << " with " << *(m_event_tasks_end-1) << std::endl;
+                        if (iter != m_event_tasks_end-1) {
+                            std::swap(*iter, *(m_event_tasks_end-1));
+                        }
+                        iter--;
+                        m_event_tasks_end--;
+                        break;
+                    }
+                    case WakeupCondition::NONE:;
+                    case WakeupCondition::EVENT:;
+                    }
+                }
+            }
+
+            if (m_timed_tasks.begin() != m_timed_tasks_end) {
+                // timed task, wait for next task
+                sched_clock::time_point next_wakeup = m_timed_tasks.front()->condition.wakeup_at;
+                int64_t us_to_sleep = std::chrono::duration_cast<std::chrono::microseconds>(next_wakeup - now).count();
+                if (us_to_sleep > 0) {
+                    usleep(us_to_sleep);
                 }
             }
         }

@@ -21,8 +21,9 @@ int main()
     PeriodicSleep c2;
     WaitForNotify c3;
 
-    Scheduler<2> scheduler;
-    scheduler.add_task(&c1, 100000, "c1");
+    Scheduler<3> scheduler;
+    scheduler.add_task(&c1, 30000, "c1");
+    scheduler.add_task(&c2, 12000, "c2");
     scheduler.add_task(&c3);
     //scheduler.add_task(&c2, 1300, "c2");
 
