@@ -113,7 +113,6 @@ public:
             {
                 std::pop_heap(m_timed_tasks.begin(), m_timed_tasks_end);
                 Task &task = **(m_timed_tasks_end-1);
-                // std::cout << "task " << &task << " is ready to run (time-based)" << std::endl;
                 assert(task.condition.type == WakeupCondition::TIMER);
                 task.condition = task.coro->step();
                 switch (task.condition.type)
@@ -128,7 +127,6 @@ public:
                 case WakeupCondition::NONE:
                 case WakeupCondition::EVENT:
                 {
-//                    std::cout << "  -> is now event-based" << std::endl;
                     // move task to event list
                     *m_event_tasks_end++ = &task;
                     // intentionall fall-through
@@ -149,26 +147,20 @@ public:
                 Task &task = **iter;
                 assert(task.condition.type == WakeupCondition::NONE ||
                        task.condition.type == WakeupCondition::EVENT);
-//                std::cout << "inspecting task " << *iter << " (event-based)" << std::endl;
                 if (!task.can_run_now(now)) {
-//                    std::cout << "  not ready to run" << std::endl;
                     continue;
                 }
                 if (task.can_run_now(now)) {
-//                    std::cout << "  ready to run" << std::endl;
                     task.condition = task.coro->step();
                     switch (task.condition.type)
                     {
                     case WakeupCondition::TIMER:
                     {
-//                        std::cout << "  -> is now timed" << std::endl;
                         add_timed_task(task);
                         // intentional fallthrough
                     }
                     case WakeupCondition::FINSIHED:
                     {
-//                        std::cout << "replacing " << *iter
-//                                  << " with " << *(m_event_tasks_end-1) << std::endl;
                         if (iter != m_event_tasks_end-1) {
                             std::swap(*iter, *(m_event_tasks_end-1));
                         }
